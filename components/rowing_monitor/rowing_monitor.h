@@ -73,9 +73,15 @@ class RowingMonitorComponent : public Component, public api::CustomAPIDevice {
 
   uint32_t last_publish_ms_{0};
 
+  uint32_t last_nonzero_delta_ms_{0};
+  uint16_t quad_zero_delta_streak_{0};
+
   bool reset_last_sample_{false};
   uint32_t reset_sample_change_ms_{0};
   bool reset_stable_pressed_prev_{false};
+
+  void sync_prev_state_from_gpio_();
+  void tick_fsm_watchdog_(uint32_t now_ms);
 
   void process_quadrature_(uint32_t now_ms);
   void advance_stroke_fsm_(int8_t delta, uint32_t now_ms);
@@ -87,7 +93,7 @@ class RowingMonitorComponent : public Component, public api::CustomAPIDevice {
 
   void process_reset_pin_(uint32_t now_ms);
 
-  void perform_session_reset_();
+  void perform_session_reset_(uint32_t now_ms);
 
   void publish_every_sensor_();
 };

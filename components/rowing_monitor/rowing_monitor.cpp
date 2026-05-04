@@ -1,8 +1,21 @@
 #include "rowing_monitor.h"
 #include <algorithm>
+#include <cstdint>
+
+#include "esphome/core/log.h"
 
 namespace esphome {
 namespace rowing_monitor {
+
+// -----------------------------------------------------------------------------
+// ROWER DEBUG SECTION A — Uncomment for verbose per-loop quadrature traces.
+// Remove or leave commented for production firmware.
+//
+// #define ROWING_MONITOR_DEBUG_EVERY_LOOP
+
+static const char *const TAG = "rower";
+
+// -----------------------------------------------------------------------------
 
 static constexpr int8_t QUAD_TABLE[16] = {
     0, -1, +1, 0,
@@ -21,6 +34,11 @@ static constexpr uint32_t MIN_STROKE_MS = 700;
 static constexpr uint32_t ACTIVE_IDLE_MS = 1500;
 static constexpr uint32_t DEBOUNCE_MS = 30;
 
+/// Reset FSM/quadrature if no nonzero delta persists this long (ms).
+static constexpr uint32_t FSM_NO_DELTA_MS = 5000;
+/// Clamp |travel_| to sane window; resets travel and quad sync outside this range.
+static constexpr int32_t TRAVEL_ABS_LIMIT = 50;
+
 static constexpr float METERS_VALID = 0.6667f;
 static constexpr float METERS_SHORT = 0.5f * METERS_VALID;
 static constexpr float METERS_MICRO = 0.25f * METERS_VALID;
@@ -36,13 +54,18 @@ bool RowingMonitorComponent::movement_reference_live_(uint32_t now_ms) const {
   return (now_ms - this->last_activity_reference_ms_()) <= ACTIVE_IDLE_MS;
 }
 
+void RowingMonitorComponent::sync_prev_state_from_gpio_() {
+  int s1 = this->step1_pin_->digital_read() ? 1 : 0;
+  int s2 = this->step2_pin_->digital_read() ? 1 : 0;
+  this->prev_state_ = static_cast<uint8_t>((s1 << 1) | s2);
+}
+
 void RowingMonitorComponent::setup() {
   uint32_t n = millis();
   this->last_movement_activity_ms_ = n;
   this->last_publish_ms_ = n;
-  int s1 = this->step1_pin_->digital_read() ? 1 : 0;
-  int s2 = this->step2_pin_->digital_read() ? 1 : 0;
-  this->prev_state_ = static_cast<uint8_t>((s1 << 1) | s2);
+  this->last_nonzero_delta_ms_ = n;
+  this->sync_prev_state_from_gpio_();
   this->reset_last_sample_ = this->reset_pin_->digital_read();
   this->reset_sample_change_ms_ = n;
   this->reset_stable_pressed_prev_ = false;
@@ -54,19 +77,73 @@ void RowingMonitorComponent::tick_spm_decay_(uint32_t now_ms) {
     this->current_spm_ = 0.0f;
 }
 
+void RowingMonitorComponent::tick_fsm_watchdog_(uint32_t now_ms) {
+  uint32_t elapsed = now_ms - this->last_nonzero_delta_ms_;
+  if (elapsed <= FSM_NO_DELTA_MS)
+    return;
+
+  const bool stuck_non_idle = this->phase_ != PHASE_IDLE;
+  const bool idle_bad_travel =
+      (this->phase_ == PHASE_IDLE) &&
+      (this->travel_ < -TRAVEL_ABS_LIMIT || this->travel_ > TRAVEL_ABS_LIMIT);
+
+  if (!stuck_non_idle && !idle_bad_travel)
+    return;
+
+  ESP_LOGW(TAG, "FSM watchdog: no quadrature delta for >%u ms (phase=%u travel=%ld), resetting",
+           (unsigned) FSM_NO_DELTA_MS, (unsigned) this->phase_, (long) this->travel_);
+
+  this->phase_ = PHASE_IDLE;
+  this->stroke_min_travel_ = 0;
+  this->travel_ = 0;
+  this->stroke_enter_ms_ = 0;
+  this->sync_prev_state_from_gpio_();
+  this->last_nonzero_delta_ms_ = now_ms;
+  this->quad_zero_delta_streak_ = 0;
+}
+
 void RowingMonitorComponent::process_quadrature_(uint32_t now_ms) {
   int s1 = this->step1_pin_->digital_read() ? 1 : 0;
   int s2 = this->step2_pin_->digital_read() ? 1 : 0;
-  auto state = static_cast<uint8_t>((s1 << 1) | s2);
-  auto index = static_cast<uint8_t>((this->prev_state_ << 2) | state);
-  int8_t delta = QUAD_TABLE[index];
+  const auto state = static_cast<uint8_t>((s1 << 1) | s2);
+  const auto index = static_cast<uint8_t>((this->prev_state_ << 2) | state);
+  const int8_t delta = QUAD_TABLE[index];
+
+#ifdef ROWING_MONITOR_DEBUG_EVERY_LOOP
+  ESP_LOGD(TAG, "s1=%d s2=%d state=%u prev=%u delta=%d travel=%ld phase=%u", s1, s2, (unsigned) state,
+           (unsigned) this->prev_state_, (int) delta, (long) this->travel_, (unsigned) this->phase_);
+#endif
+
   this->prev_state_ = state;
 
-  if (delta != 0) {
+  if (delta == 0) {
+    if (this->quad_zero_delta_streak_ < UINT16_MAX)
+      this->quad_zero_delta_streak_++;
+    if (this->quad_zero_delta_streak_ == 1001) {
+      ESP_LOGW(TAG, "Quadrature: consecutive delta==0 occurrences exceeded 1000");
+    }
+  } else {
+    this->quad_zero_delta_streak_ = 0;
+    this->last_nonzero_delta_ms_ = now_ms;
     this->last_movement_activity_ms_ = now_ms;
     this->travel_ += delta;
     this->advance_stroke_fsm_(delta, now_ms);
+
+    if (this->travel_ < -TRAVEL_ABS_LIMIT || this->travel_ > TRAVEL_ABS_LIMIT) {
+      ESP_LOGW(TAG, "Travel clamp: |travel| exceeded %ld (value=%ld), resetting to 0", (long) TRAVEL_ABS_LIMIT,
+               (long) this->travel_);
+      this->travel_ = 0;
+      this->phase_ = PHASE_IDLE;
+      this->stroke_min_travel_ = 0;
+      this->stroke_enter_ms_ = 0;
+      this->sync_prev_state_from_gpio_();
+      this->last_nonzero_delta_ms_ = now_ms;
+    }
   }
+
+#ifdef ROWING_MONITOR_DEBUG_EVERY_LOOP
+  ESP_LOGD(TAG, "after: travel=%ld phase=%u", (long) this->travel_, (unsigned) this->phase_);
+#endif
 }
 
 void RowingMonitorComponent::advance_stroke_fsm_(int8_t delta, uint32_t now_ms) {
@@ -144,7 +221,7 @@ void RowingMonitorComponent::complete_stroke_(uint32_t now_ms) {
   this->prev_accepted_stroke_for_spm_ms_ = now_ms;
 }
 
-void RowingMonitorComponent::perform_session_reset_() {
+void RowingMonitorComponent::perform_session_reset_(uint32_t now_ms) {
   this->distance_m_ = 0;
   this->total_strokes_ = 0;
   this->valid_strokes_ = 0;
@@ -153,8 +230,15 @@ void RowingMonitorComponent::perform_session_reset_() {
   this->active_time_s_ = 0;
   this->current_spm_ = 0.0f;
 
+  this->travel_ = 0;
   this->phase_ = PHASE_IDLE;
   this->stroke_min_travel_ = 0;
+  this->stroke_enter_ms_ = 0;
+  this->sync_prev_state_from_gpio_();
+
+  this->last_movement_activity_ms_ = now_ms;
+  this->last_nonzero_delta_ms_ = now_ms;
+  this->quad_zero_delta_streak_ = 0;
 
   this->prev_accepted_stroke_for_spm_ms_ = 0;
   this->last_accepted_stroke_ms_ = 0;
@@ -179,7 +263,7 @@ void RowingMonitorComponent::process_reset_pin_(uint32_t now_ms) {
   // Configure YAML so digital_read()==true represents a pressed switch (normally inverted GPIO + pull-up).
   const bool stable_pressed = raw;
   if (stable_pressed && !this->reset_stable_pressed_prev_)
-    this->perform_session_reset_();
+    this->perform_session_reset_(now_ms);
   this->reset_stable_pressed_prev_ = stable_pressed;
 }
 
@@ -207,6 +291,7 @@ void RowingMonitorComponent::loop() {
 
   this->process_reset_pin_(now_ms);
   this->process_quadrature_(now_ms);
+  this->tick_fsm_watchdog_(now_ms);
   this->tick_spm_decay_(now_ms);
 
   if (now_ms - this->last_publish_ms_ < 1000)
@@ -214,6 +299,9 @@ void RowingMonitorComponent::loop() {
   this->last_publish_ms_ = now_ms;
 
   this->uptime_s_++;
+
+  // ROWER DEBUG SECTION B — 1 Hz heartbeat (remove this line when silencing debug output).
+  ESP_LOGD(TAG, "loop alive, travel=%ld", (long) this->travel_);
 
   if (this->movement_reference_live_(now_ms) &&
       (this->current_spm_ > 0.0f || this->phase_ != PHASE_IDLE)) {
