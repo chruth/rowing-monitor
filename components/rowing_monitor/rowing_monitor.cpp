@@ -11,7 +11,7 @@ namespace rowing_monitor {
 // ROWER DEBUG SECTION A — Uncomment for verbose per-loop quadrature traces.
 // Remove or leave commented for production firmware.
 //
-// #define ROWING_MONITOR_DEBUG_EVERY_LOOP
+#define ROWING_MONITOR_DEBUG_EVERY_LOOP
 
 static const char *const TAG = "rower";
 
