@@ -15,8 +15,6 @@ esp32:
 logger:
 
 api:
-  password: ""
-  homeassistant_services: true
 
 ota:
   - platform: esphome
@@ -38,19 +36,19 @@ sensor:
   - platform: rowing_monitor
     id: row_core
     step1_pin:
-      number: GPIO18
+      number: GPIO32
       mode:
         input: true
         pullup: false
       inverted: false
     step2_pin:
-      number: GPIO19
+      number: GPIO33
       mode:
         input: true
         pullup: false
       inverted: false
     reset_pin:
-      number: GPIO23
+      number: GPIO25
       mode:
         input: true
         pullup: true
